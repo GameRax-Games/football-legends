@@ -20,6 +20,9 @@ const BALL_FRICTION = 0.985
 const GOAL_H = 158
 const GOAL_W = 26
 const KICK_POWER = 13
+const SMASH_POWER = 24 // special-move strike power
+const SMASH_ANIM = 16 // frames of smash animation
+const SMASH_COOLDOWN = 18000 // ms before smash is ready again
 const MATCH_TIME = 90 // seconds
 
 type Mode = "cpu" | "2p"
@@ -51,6 +54,8 @@ type Player = {
   onGround: boolean
   facing: 1 | -1
   kickTimer: number // frames remaining in a kick animation
+  smashTimer: number // frames remaining in a smash animation
+  smashReadyAt: number // timestamp (ms) when smash becomes available
   team: Team
   isCpu: boolean
 }
@@ -65,7 +70,7 @@ type Ball = {
 }
 
 function makePlayer(x: number, facing: 1 | -1, team: Team, isCpu: boolean): Player {
-  return { x, y: GROUND_Y, vx: 0, vy: 0, onGround: true, facing, kickTimer: 0, team, isCpu }
+  return { x, y: GROUND_Y, vx: 0, vy: 0, onGround: true, facing, kickTimer: 0, smashTimer: 0, smashReadyAt: 0, team, isCpu }
 }
 
 function makeBall(): Ball {
@@ -86,6 +91,8 @@ export default function FootballGame() {
   const [score, setScore] = useState<[number, number]>([0, 0])
   const [timeLeft, setTimeLeft] = useState(MATCH_TIME)
   const [message, setMessage] = useState<string>("")
+  const [smashCd, setSmashCd] = useState<[number, number]>([0, 0])
+  const smashCdRef = useRef<[number, number]>([0, 0])
 
   // Mutable simulation refs (so the RAF loop never gets stale values)
   const stateRef = useRef<GameState>("menu")
@@ -138,7 +145,7 @@ export default function FootballGame() {
     const down = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase()
       if (
-        ["arrowleft", "arrowright", "arrowup", "arrowdown", " ", "w", "a", "s", "d"].includes(k)
+        ["arrowleft", "arrowright", "arrowup", "arrowdown", " ", "w", "a", "s", "d", "x", "z", "k", "l"].includes(k)
       ) {
         e.preventDefault()
       }
@@ -164,6 +171,8 @@ export default function FootballGame() {
     right: boolean,
     jump: boolean,
     kick: boolean,
+    smash: boolean,
+    now: number,
   ) => {
     if (left && !right) {
       p.vx = -PLAYER_SPEED
@@ -178,7 +187,11 @@ export default function FootballGame() {
       p.vy = -PLAYER_JUMP
       p.onGround = false
     }
-    if (kick && p.kickTimer <= 0 && p.onGround) {
+    // Smash: powerful special strike, works in the air, on an 18s cooldown.
+    if (smash && p.smashTimer <= 0 && p.kickTimer <= 0 && now >= p.smashReadyAt) {
+      p.smashTimer = SMASH_ANIM
+      p.smashReadyAt = now + SMASH_COOLDOWN
+    } else if (kick && p.kickTimer <= 0 && p.smashTimer <= 0 && p.onGround) {
       p.kickTimer = 14
     }
   }
@@ -196,6 +209,7 @@ export default function FootballGame() {
     if (p.x < PLAYER_R) p.x = PLAYER_R
     if (p.x > WIDTH - PLAYER_R) p.x = WIDTH - PLAYER_R
     if (p.kickTimer > 0) p.kickTimer--
+    if (p.smashTimer > 0) p.smashTimer--
   }
 
   // Center of the player body used for ball collisions.
@@ -203,7 +217,9 @@ export default function FootballGame() {
 
   // The tip of the foot when kicking, used to detect a powered strike.
   const footTip = (p: Player) => {
-    const swing = p.kickTimer > 0 ? Math.sin((1 - p.kickTimer / 14) * Math.PI) : 0
+    const kickS = p.kickTimer > 0 ? Math.sin((1 - p.kickTimer / 14) * Math.PI) : 0
+    const smashS = p.smashTimer > 0 ? Math.sin((1 - p.smashTimer / SMASH_ANIM) * Math.PI) : 0
+    const swing = Math.max(kickS, smashS)
     const reach = 26 + swing * 30
     return { x: p.x + p.facing * reach, y: p.y - 10 - swing * 10 }
   }
@@ -228,8 +244,20 @@ export default function FootballGame() {
       ball.vrot = ball.vx * 0.05
     }
 
-    // Powered kick
-    if (p.kickTimer > 0) {
+    // Smash (special) — strong, flatter strike with a wider hit window.
+    if (p.smashTimer > 0) {
+      const f = footTip(p)
+      dx = ball.x - f.x
+      dy = ball.y - f.y
+      dist = Math.hypot(dx, dy)
+      if (dist < BALL_R + 26) {
+        const power = SMASH_POWER
+        ball.vx = p.facing * power + p.vx * 0.6
+        ball.vy = -power * 0.42
+        ball.vrot = p.facing * 0.7
+      }
+    } else if (p.kickTimer > 0) {
+      // Powered kick
       const f = footTip(p)
       dx = ball.x - f.x
       dy = ball.y - f.y
@@ -297,7 +325,7 @@ export default function FootballGame() {
   }
 
   // Simple but lively CPU AI
-  const runAi = (p: Player, ball: Ball) => {
+  const runAi = (p: Player, ball: Ball, now: number) => {
     const diff = diffRef.current
     const react = diff === "easy" ? 0.4 : diff === "normal" ? 0.62 : 0.85
     const aggression = diff === "easy" ? 0.22 : diff === "normal" ? 0.4 : 0.6
@@ -308,6 +336,7 @@ export default function FootballGame() {
     let right = false
     let jump = false
     let kick = false
+    let smash = false
 
     if (Math.random() < react) {
       if (p.x > targetX + 6) left = true
@@ -321,8 +350,14 @@ export default function FootballGame() {
 
     // kick when ball is in front and close
     const inFront = (ball.x - p.x) * p.facing > -20
-    if (Math.abs(ball.x - p.x) < 70 && Math.abs(ball.y - (p.y - 40)) < 90 && inFront && Math.random() < aggression) {
+    const closeToBall = Math.abs(ball.x - p.x) < 70 && Math.abs(ball.y - (p.y - 40)) < 90
+    if (closeToBall && inFront && Math.random() < aggression) {
       kick = true
+    }
+
+    // occasionally unleash a smash when it is ready and the ball is strikeable
+    if (closeToBall && inFront && now >= p.smashReadyAt && Math.random() < aggression * 0.12) {
+      smash = true
     }
 
     // Make sure CPU faces the ball / goal it attacks (left)
@@ -331,7 +366,7 @@ export default function FootballGame() {
     // But when far behind ball, chase toward left goal to attack
     if (Math.abs(ball.x - p.x) < 40 && p.x < ball.x) p.facing = -1
 
-    controlPlayer(p, left, right, jump, kick)
+    controlPlayer(p, left, right, jump, kick, smash, now)
   }
 
   const concede = useCallback((scoringSide: "p1" | "p2") => {
@@ -397,25 +432,29 @@ export default function FootballGame() {
           const p2 = p2Ref.current
           const ball = ballRef.current
 
-          // Player 1 controls
+          // Player 1 controls — X/S/Space kick, Z smash
           controlPlayer(
             p1,
             keys["a"],
             keys["d"],
             keys["w"],
-            keys["s"] || keys[" "],
+            keys["x"] || keys["s"] || keys[" "],
+            keys["z"],
+            now,
           )
 
-          // Player 2 or CPU
+          // Player 2 or CPU — L/↓ kick, K smash
           if (modeRef.current === "cpu") {
-            runAi(p2, ball)
+            runAi(p2, ball, now)
           } else {
             controlPlayer(
               p2,
               keys["arrowleft"],
               keys["arrowright"],
               keys["arrowup"],
-              keys["arrowdown"] || keys["enter"],
+              keys["l"] || keys["arrowdown"] || keys["enter"],
+              keys["k"],
+              now,
             )
           }
 
@@ -426,6 +465,14 @@ export default function FootballGame() {
           const goal = integrateBall(ball)
           if (goal === "left") concede("p2")
           else if (goal === "right") concede("p1")
+        }
+
+        // Update smash cooldown readouts (only when the integer seconds change)
+        const cd1 = Math.max(0, Math.ceil((p1Ref.current.smashReadyAt - now) / 1000))
+        const cd2 = Math.max(0, Math.ceil((p2Ref.current.smashReadyAt - now) / 1000))
+        if (cd1 !== smashCdRef.current[0] || cd2 !== smashCdRef.current[1]) {
+          smashCdRef.current = [cd1, cd2]
+          setSmashCd([cd1, cd2])
         }
       }
 
@@ -575,7 +622,22 @@ export default function FootballGame() {
     ctx.ellipse(x, GROUND_Y - 4, 26, 6, 0, 0, Math.PI * 2)
     ctx.fill()
 
-    const swing = p.kickTimer > 0 ? Math.sin((1 - p.kickTimer / 14) * Math.PI) : 0
+    const kickS = p.kickTimer > 0 ? Math.sin((1 - p.kickTimer / 14) * Math.PI) : 0
+    const smashS = p.smashTimer > 0 ? Math.sin((1 - p.smashTimer / SMASH_ANIM) * Math.PI) : 0
+    const swing = Math.max(kickS, smashS)
+
+    // smash energy streak at the striking foot
+    if (p.smashTimer > 0) {
+      const gx = x + p.facing * (30 + smashS * 30)
+      const gy = feetY - 12 - smashS * 12
+      const glow = ctx.createRadialGradient(gx, gy, 2, gx, gy, 26)
+      glow.addColorStop(0, "rgba(250,204,21,0.9)")
+      glow.addColorStop(1, "rgba(250,204,21,0)")
+      ctx.fillStyle = glow
+      ctx.beginPath()
+      ctx.arc(gx, gy, 26, 0, Math.PI * 2)
+      ctx.fill()
+    }
 
     // back leg
     ctx.strokeStyle = t.shorts === "#ffffff" ? "#e5e7eb" : t.shorts
@@ -808,7 +870,15 @@ function Toggle({
   )
 }
 
-function Controls({ mode, compact }: { mode: Mode; compact?: boolean }) {
+function Controls({
+  mode,
+  compact,
+  smashCd,
+}: {
+  mode: Mode
+  compact?: boolean
+  smashCd?: [number, number]
+}) {
   return (
     <div
       className={`flex flex-wrap items-center justify-center gap-x-6 gap-y-1 text-slate-300 ${
@@ -824,8 +894,11 @@ function Controls({ mode, compact }: { mode: Mode; compact?: boolean }) {
         move
         <Key>W</Key>
         jump
-        <Key>S</Key>
+        <Key>X</Key>
         kick
+        <Key>Z</Key>
+        smash
+        {smashCd !== undefined && <Cooldown seconds={smashCd[0]} />}
       </div>
       {mode === "2p" && (
         <div className="flex items-center gap-2">
@@ -837,11 +910,29 @@ function Controls({ mode, compact }: { mode: Mode; compact?: boolean }) {
           move
           <Key>↑</Key>
           jump
-          <Key>↓</Key>
+          <Key>L</Key>
           kick
+          <Key>K</Key>
+          smash
+          {smashCd !== undefined && <Cooldown seconds={smashCd[1]} />}
         </div>
       )}
     </div>
+  )
+}
+
+function Cooldown({ seconds }: { seconds: number }) {
+  if (seconds <= 0) {
+    return (
+      <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-400">
+        Smash ready
+      </span>
+    )
+  }
+  return (
+    <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-bold tabular-nums text-amber-400">
+      {seconds}s
+    </span>
   )
 }
 
